@@ -1,0 +1,192 @@
+#! /usr/bin/python
+
+import imp
+import struct
+import binascii
+import difflib
+import re
+
+struct_parser = imp.load_source('check-struct', 'build-aux/check-structs')
+msg_parser = imp.load_source('extract-ofp-msgs', 'build-aux/extract-ofp-msgs')
+
+ofstructs = struct_parser.checkStructs(["pktgen", "-Iinclude",
+                              "include/openflow/openflow-1.4.h"])
+
+nxtstructs = struct_parser.checkStructs(["pktgen", "-Iinclude",
+                              "include/openflow/nicira-ext.h"])
+
+structs = dict(ofstructs.items() + nxtstructs.items())
+
+raws = msg_parser.extract_and_display("lib/ofp-msgs.h", "out", False)
+
+def make_field(field, value):
+    n = 1
+    if field[0] == "char":
+        fmt = "c"
+    elif field[0] == "uint8_t":
+        fmt = "B"
+    elif field[0] == "ovs_be16":
+        fmt = ">H"
+    elif field[0] == "ovs_be32":
+        fmt = ">I"
+    elif field[0] == "ovs_be64" or field[0] == "ovs_32aligned_be64":
+        fmt = ">Q"
+    elif "uint8_t[" in field[0]:
+        exp = re.compile("(\d+)")
+        n = int(exp.search(field[0]).group(0))
+        fmt = "B"
+
+    value = int(value)
+    result = ""
+    if n == 1:
+        result = struct.pack(fmt, value)
+    else:
+        while n > 0:
+            result = struct.pack(fmt, value & 0xff) + result
+            value = value >> 8
+            n = n - 1
+
+    hexstr = binascii.hexlify(result)
+
+    return hexstr
+
+def make_struct(name, s):
+    body = ""
+    print(name)
+    for f in s:
+        field = f[0] + " " + f[1]
+        if f[2] > 1:
+            field += "[" + str(f[2]) + "] = "
+        else:
+            field += " = "
+
+        for i in range(int(f[2])):
+                if f[1] == "pad":
+                    value = 0
+                else:
+                    print "\t",
+                    value = raw_input(field)
+                mkf = make_field(f, value)
+                body += mkf
+    return body
+
+def field_size(f):
+    if f == "char":
+        return 1
+    elif f == "uint8_t":
+        return 1
+    elif f == "ovs_be16":
+        return 2
+    elif f == "ovs_be32":
+        return 4
+    elif f == "ovs_be64" or f == "ovs_32aligned_be64":
+        return 8
+    elif "uint8_t[" in f:
+        exp = re.compile("(\d+)")
+        n = exp.search(f).group(0)
+        return int(n)
+
+    print("Unknown type " + f)
+
+def struct_size(s):
+    size = 0
+    for f in s:
+        if "struct" in f[0]:
+            size += struct_size(structs[f[0]])
+        else:
+            size += field_size(f[0]) * f[2]
+    return size
+
+def print_struct_def(name, s):
+    print(name)
+    for f in s:
+        print("\t" + f[0] + " " + f[1])
+
+def find_raw_match(ver, name, raws):
+    threshold = 0.6
+    best = None
+    bestratio = 0
+    for r in raws:
+        item = raws[r]
+        if item['min_version'] > ver or item['max_version'] < ver:
+            continue
+        ratio = difflib.SequenceMatcher(None, name.lower(), item['human_name'].lower()).ratio()
+        if ratio > bestratio and ratio > threshold:
+            bestratio = ratio
+            best = r
+
+    return best
+
+def get_msg_body(raw):
+    if raw['min_body'] == 0:
+        return [], []
+
+    exp = re.compile("\(([^\)]*)\)")
+    b = exp.findall(raw['min_body'])
+    e = exp.findall(raw['extra_multiple'])
+    return b, e
+
+def make_header(ver, _type, size):
+    header = structs['struct ofp_header']
+    body = ""
+    print("ofp_header")
+
+    xid = 0x0000000a
+    values = (ver, _type, size, xid)
+    i = 0
+    for f in header:
+        field = "\t" + f[0] + " " + f[1] + " = "
+
+        print(field + str(values[i]))
+        mkf = make_field(f, values[i])
+        body += mkf
+        i = i + 1
+    return body
+
+
+def make_msg(ver, raw_match):
+    bodylist, extralist = get_msg_body(raw_match)
+
+    body = ""
+    totalsize = 8
+    for entry in bodylist:
+        body += make_struct(entry, structs[entry])
+        totalsize += struct_size(structs[entry])
+
+    for entry in extralist:
+        if "struct" in entry:
+            body += make_struct(entry, structs[entry])
+            totalsize += struct_size(structs[entry])
+        else:
+            value = raw_input(entry + " = ")
+            body += make_field(entry.split(" "), value)
+            totalsize += field_size(entry.split(" ")[0])
+
+    _type = raw_match['hdrs'][0][1]
+    header = make_header(ver, _type, totalsize)
+    print("Size: " + str(totalsize))
+    print("Extra: " + str(raw_match['extra_multiple']))
+    return header + body
+
+def make():
+
+    try:
+        ver = int(raw_input("OpenFlow version number: "))
+    except ValueError:
+        print("Wrong version. Using default 1")
+        ver = 1
+
+    msg_name = raw_input("Message name: ")
+    match = find_raw_match(ver, msg_name, raws)
+    print(match)
+
+    if match is None:
+        sys.exit(1)
+
+    msg = make_msg(ver, raws[match])
+    print("Packet: " + msg)
+
+    return msg
+
+msg = make()
+
